@@ -4,7 +4,91 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from numpy import random
+from mmcv.cnn.bricks import ConvTranspose3d, Conv3d
 
+
+def conv3d_gn_relu(in_channels, out_channels, kernel_size=1, stride=1):
+    return nn.Sequential(
+        Conv3d(in_channels, out_channels, kernel_size, stride, bias=False),
+        nn.GroupNorm(16, out_channels),
+        nn.ReLU(inplace=True),
+    )
+
+
+def deconv3d_gn_relu(in_channels, out_channels, kernel_size=2, stride=2):
+    return nn.Sequential(
+        ConvTranspose3d(in_channels, out_channels, kernel_size, stride, bias=False),
+        nn.GroupNorm(16, out_channels),
+        nn.ReLU(inplace=True),
+    )
+
+
+def sparse2dense(indices, value, dense_shape, empty_value=0):
+    B, N = indices.shape[:2]  # [B, N, 3]
+
+    batch_index = torch.arange(B).unsqueeze(1).expand(B, N)
+    dense = torch.ones([B] + dense_shape, device=value.device, dtype=value.dtype) * empty_value
+    dense[batch_index, indices[..., 0], indices[..., 1], indices[..., 2]] = value
+    
+    mask = torch.zeros([B] + dense_shape[:3], dtype=torch.bool, device=value.device)
+    mask[batch_index, indices[..., 0], indices[..., 1], indices[..., 2]] = 1
+
+    return dense, mask
+
+
+@torch.no_grad()
+def generate_grid(n_vox, interval):
+    # Create voxel grid
+    grid_range = [torch.arange(0, n_vox[axis], interval) for axis in range(3)]
+    grid = torch.stack(torch.meshgrid(grid_range[0], grid_range[1], grid_range[2], indexing='ij'))  # 3 dx dy dz
+    grid = grid.cuda().view(3, -1).permute(1, 0)  # N, 3
+    return grid[None]  # 1, N, 3
+
+
+def batch_indexing(batched_data: torch.Tensor, batched_indices: torch.Tensor, layout='channel_first'):
+    def batch_indexing_channel_first(batched_data: torch.Tensor, batched_indices: torch.Tensor):
+        """
+        :param batched_data: [batch_size, C, N]
+        :param batched_indices: [batch_size, I1, I2, ..., Im]
+        :return: indexed data: [batch_size, C, I1, I2, ..., Im]
+        """
+        def product(arr):
+            p = 1
+            for i in arr:
+                p *= i
+            return p
+        assert batched_data.shape[0] == batched_indices.shape[0]
+        batch_size, n_channels = batched_data.shape[:2]
+        indices_shape = list(batched_indices.shape[1:])
+        batched_indices = batched_indices.reshape([batch_size, 1, -1])
+        batched_indices = batched_indices.expand([batch_size, n_channels, product(indices_shape)])
+        result = torch.gather(batched_data, dim=2, index=batched_indices.to(torch.int64))
+        result = result.view([batch_size, n_channels] + indices_shape)
+        return result
+
+    def batch_indexing_channel_last(batched_data: torch.Tensor, batched_indices: torch.Tensor):
+        """
+        :param batched_data: [batch_size, N, C]
+        :param batched_indices: [batch_size, I1, I2, ..., Im]
+        :return: indexed data: [batch_size, I1, I2, ..., Im, C]
+        """
+        assert batched_data.shape[0] == batched_indices.shape[0]
+        batch_size = batched_data.shape[0]
+        view_shape = [batch_size] + [1] * (len(batched_indices.shape) - 1)
+        expand_shape = [batch_size] + list(batched_indices.shape)[1:]
+        indices_of_batch = torch.arange(batch_size, dtype=torch.long, device=batched_data.device)
+        indices_of_batch = indices_of_batch.view(view_shape).expand(expand_shape)  # [bs, I1, I2, ..., Im]
+        if len(batched_data.shape) == 2:
+            return batched_data[indices_of_batch, batched_indices.to(torch.long)]
+        else:
+            return batched_data[indices_of_batch, batched_indices.to(torch.long), :]
+
+    if layout == 'channel_first':
+        return batch_indexing_channel_first(batched_data, batched_indices)
+    elif layout == 'channel_last':
+        return batch_indexing_channel_last(batched_data, batched_indices)
+    else:
+        raise ValueError
 
 class GridMask(nn.Module):
     def __init__(self, ratio=0.5, prob=0.7):
@@ -216,6 +300,17 @@ def hsv_to_rgb(image: torch.Tensor) -> torch.Tensor:
 
     return out
 
+def sparse2dense(indices, value, dense_shape, empty_value=0):
+    B, N = indices.shape[:2]  # [B, N, 3]
+
+    batch_index = torch.arange(B).unsqueeze(1).expand(B, N)
+    dense = torch.ones([B] + dense_shape, device=value.device, dtype=value.dtype) * empty_value
+    dense[batch_index, indices[..., 0], indices[..., 1], indices[..., 2]] = value
+    
+    mask = torch.zeros([B] + dense_shape[:3], dtype=torch.bool, device=value.device)
+    mask[batch_index, indices[..., 0], indices[..., 1], indices[..., 2]] = 1
+
+    return dense, mask
 
 class GpuPhotoMetricDistortion:
     """Apply photometric distortion to image sequentially, every transformation

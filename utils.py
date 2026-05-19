@@ -120,13 +120,7 @@ class MyTextLoggerHook(TextLoggerHook):
         if runner.log_buffer.ready:
             metrics = self.get_loggable_tags(runner)
             runner.logger.info('--- Evaluation Results ---')
-            runner.logger.info('mAP: %.4f' % metrics['val/pts_bbox_NuScenes/mAP'])
-            runner.logger.info('mATE: %.4f' % metrics['val/pts_bbox_NuScenes/mATE'])
-            runner.logger.info('mASE: %.4f' % metrics['val/pts_bbox_NuScenes/mASE'])
-            runner.logger.info('mAOE: %.4f' % metrics['val/pts_bbox_NuScenes/mAOE'])
-            runner.logger.info('mAVE: %.4f' % metrics['val/pts_bbox_NuScenes/mAVE'])
-            runner.logger.info('mAAE: %.4f' % metrics['val/pts_bbox_NuScenes/mAAE'])
-            runner.logger.info('NDS: %.4f' % metrics['val/pts_bbox_NuScenes/NDS'])
+            runner.logger.info('RayIoU: %.4f' % metrics['val/RayIoU'])
 
 
 @HOOKS.register_module()

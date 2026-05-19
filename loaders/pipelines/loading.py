@@ -4,6 +4,10 @@ import numpy as np
 from mmdet.datasets.builder import PIPELINES
 from numpy.linalg import inv
 from mmcv.runner import get_dist_info
+import torch
+from mmcv.parallel import DataContainer as DC
+from mmdet.datasets.pipelines import to_tensor
+from torchvision.transforms.functional import rotate
 
 
 def compose_lidar2img(ego2global_translation_curr,
@@ -489,5 +493,147 @@ class LoadMultiViewImageFromMultiSweepsFutureInterleave(object):
                 results['lidar2img'].append(results_next['lidar2img'][i * 6 + j])
                 results['lidar2img_t1'].append(results_next['lidar2img_t1'][i * 6 + j])
                 results['lidar2img_t2'].append(results_next['lidar2img_t2'][i * 6 + j])
+
+        return results
+    
+# https://github.com/HuangJunJie2017/BEVDet/blob/58c2587a8f89a1927926f0bdb6cde2917c91a9a5/mmdet3d/datasets/pipelines/loading.py#L1177
+@PIPELINES.register_module()
+class BEVAug(object):
+    def __init__(self, bda_aug_conf, classes, is_train=True):
+        self.bda_aug_conf = bda_aug_conf
+        self.is_train = is_train
+        self.classes = classes
+
+    def sample_bda_augmentation(self):
+        """Generate bda augmentation values based on bda_config."""
+        if self.is_train:
+            rotate_bda = np.random.uniform(*self.bda_aug_conf['rot_lim'])
+            scale_bda = np.random.uniform(*self.bda_aug_conf['scale_lim'])
+            flip_dx = np.random.uniform() < self.bda_aug_conf['flip_dx_ratio']
+            flip_dy = np.random.uniform() < self.bda_aug_conf['flip_dy_ratio']
+        else:
+            rotate_bda = 0
+            scale_bda = 1.0
+            flip_dx = False
+            flip_dy = False
+        return rotate_bda, scale_bda, flip_dx, flip_dy
+
+    def bev_transform(self, rotate_angle, scale_ratio, flip_dx, flip_dy):
+        """
+        Returns:
+            rot_mat: (3, 3)
+        """
+        rotate_angle = torch.tensor(rotate_angle / 180 * np.pi)
+        rot_sin = torch.sin(rotate_angle)
+        rot_cos = torch.cos(rotate_angle)
+        rot_mat = torch.Tensor([[rot_cos, -rot_sin, 0], [rot_sin, rot_cos, 0],
+                                [0, 0, 1]])
+        scale_mat = torch.Tensor([[scale_ratio, 0, 0], [0, scale_ratio, 0],
+                                  [0, 0, scale_ratio]])
+        flip_mat = torch.Tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+
+        if flip_dx:
+            flip_mat = flip_mat @ torch.Tensor([[-1, 0, 0], [0, 1, 0],
+                                                [0, 0, 1]])
+        if flip_dy:
+            flip_mat = flip_mat @ torch.Tensor([[1, 0, 0], [0, -1, 0],
+                                                [0, 0, 1]])
+        rot_mat = flip_mat @ (scale_mat @ rot_mat)
+        
+        return rot_mat
+
+    def __call__(self, results):
+        rotate_bda, scale_bda, flip_dx, flip_dy = self.sample_bda_augmentation()
+
+        bda_mat = torch.zeros(4, 4)
+        bda_mat[3, 3] = 1
+
+        # bda_rot: (3, 3)
+        bda_rot = self.bev_transform(rotate_bda, scale_bda, flip_dx, flip_dy)
+        bda_mat[:3, :3] = bda_rot
+
+        results['bda_mat'] = bda_mat
+        results['flip_dx'] = flip_dx
+        results['flip_dy'] = flip_dy
+        results['rotate_bda'] = rotate_bda
+        results['scale_bda'] = scale_bda
+
+        for i in range(len(results['ego2lidar'])):
+            results['ego2lidar'][i] = results['ego2lidar'][i] @ torch.inverse(bda_mat).numpy()  # [4, 4] @ [4, 4]
+
+        return results
+    
+    
+@PIPELINES.register_module()
+class LoadOccGTFromFile(object):
+    def __init__(self, num_classes=18, inst_class_ids=[]):
+        self.num_classes = num_classes
+        self.inst_class_ids = inst_class_ids
+    
+    def __call__(self, results):
+        occ_labels = np.load(results['occ_path'])
+        semantics = occ_labels['semantics']  # [200, 200, 16]
+        # mask_lidar = occ_labels['mask_lidar'].astype(np.bool_)  # [200, 200, 16]
+        # mask_camera = occ_labels['mask_camera'].astype(np.bool_)  # [200, 200, 16]
+
+        # results['mask_lidar'] = mask_lidar
+        # results['mask_camera'] = mask_camera
+  
+        # instance GT
+        if 'instances' in occ_labels.keys():
+            instances = occ_labels['instances']
+            instance_class_ids = [self.num_classes - 1]  # the 0-th class is always free class
+            for i in range(1, instances.max() + 1):
+                class_id = np.unique(semantics[instances == i])
+                assert class_id.shape[0] == 1, "each instance must belong to only one class"
+                instance_class_ids.append(class_id[0])
+            instance_class_ids = np.array(instance_class_ids)
+        else:
+            instances = None
+            instance_class_ids = None
+
+        instance_count = 0
+        final_instance_class_ids = []
+        final_instances = np.ones_like(semantics) * 255  # empty space has instance id "255"
+
+        for class_id in range(self.num_classes - 1):
+            if np.sum(semantics == class_id) == 0:
+                continue
+
+            if class_id in self.inst_class_ids:
+                assert instances is not None, 'instance annotation not found'
+                # treat as instances
+                for instance_id in range(len(instance_class_ids)):
+                    if instance_class_ids[instance_id] != class_id:
+                        continue
+                    final_instances[instances == instance_id] = instance_count
+                    instance_count += 1
+                    final_instance_class_ids.append(class_id)
+            else:
+                # treat as semantics
+                final_instances[semantics == class_id] = instance_count
+                instance_count += 1
+                final_instance_class_ids.append(class_id)
+
+        results['voxel_semantics'] = semantics
+        results['voxel_instances'] = final_instances
+        results['instance_class_ids'] = DC(to_tensor(final_instance_class_ids))
+
+        if results.get('rotate_bda', False):
+            semantics = torch.from_numpy(semantics).permute(2, 0, 1)  # [16, 200, 200]
+            semantics = rotate(semantics, results['rotate_bda'], fill=255).permute(1, 2, 0)  # [200, 200, 16]
+            results['voxel_semantics'] = semantics.numpy()
+
+            final_instances = torch.from_numpy(final_instances).permute(2, 0, 1)  # [16, 200, 200]
+            final_instances = rotate(final_instances, results['rotate_bda'], fill=255).permute(1, 2, 0)  # [200, 200, 16]
+            results['voxel_instances'] = final_instances.numpy()
+
+        if results.get('flip_dx', False):
+            results['voxel_semantics'] = results['voxel_semantics'][::-1, ...].copy()
+            results['voxel_instances'] = results['voxel_instances'][::-1, ...].copy()
+            
+        if results.get('flip_dy', False):
+            results['voxel_semantics'] = results['voxel_semantics'][:, ::-1, ...].copy()
+            results['voxel_instances'] = results['voxel_instances'][:, ::-1, ...].copy()
 
         return results

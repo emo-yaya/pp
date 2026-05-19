@@ -3,6 +3,8 @@ from .bbox import __all__
 from .propbev import PropBEV
 from .propbev_head import PropBEVHead
 from .propbev_transformer import PropBEVTransformer
+from .sparseocc_head import SparseOccHead
+from .sparseocc_transformer import SparseOccTransformer
 
 __all__ = [
     'PropBEV', 'PropBEVHead', 'PropBEVTransformer'
